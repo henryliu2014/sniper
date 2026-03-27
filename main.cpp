@@ -81,11 +81,11 @@ int main() {
         return 1;
     }
 
-    int duration_sec = 10;
+    int duration_sec = 100;
     if (const char* d = std::getenv("PROBE_DURATION_SEC")) {
         duration_sec = std::atoi(d);
         if (duration_sec <= 0) {
-            duration_sec = 10;
+            duration_sec = 100;
         }
     }
 
