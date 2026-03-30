@@ -16,6 +16,9 @@
 #include <string>
 #include <algorithm>
 
+extern const unsigned char pg_probe_bpf_blob_start[];
+extern const unsigned char pg_probe_bpf_blob_end[];
+
 namespace {
 volatile sig_atomic_t g_stop = 0;
 
@@ -226,7 +229,10 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
         return -1;
     }
 
-    obj = bpf_object__open_file("pg_probe.bpf.o", nullptr);
+    obj = bpf_object__open_mem(
+        pg_probe_bpf_blob_start,
+        static_cast<size_t>(pg_probe_bpf_blob_end - pg_probe_bpf_blob_start),
+        nullptr);
     if (!obj) {
         fprintf(stderr, "pg_probe: failed to open BPF object\n");
         return -1;

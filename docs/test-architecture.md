@@ -62,6 +62,8 @@ This is a fast component-functional lane. It validates the behavior users care a
 - executes SQL through `psql`
 - asserts on the emitted trace output
 
+The script requires the PostgreSQL service account name as its first argument so the harness does not need to guess which OS user should own the disposable cluster.
+
 This lane is opt-in and should be enabled only on hosts that can run BPF attachment successfully.
 
 ## Execution
@@ -75,7 +77,9 @@ cmake -S . -B build
 Enable the live lane when needed:
 
 ```bash
-cmake -S . -B build -DSNIPER_ENABLE_LIVE_FUNCTIONAL_TESTS=ON
+cmake -S . -B build \
+  -DSNIPER_ENABLE_LIVE_FUNCTIONAL_TESTS=ON \
+  -DSNIPER_LIVE_TEST_PG_OS_USER=postgres
 ```
 
 Build the functional suite only:
@@ -88,4 +92,11 @@ Run:
 
 ```bash
 ctest --test-dir build --output-on-failure
+```
+
+Manual invocation:
+
+```bash
+sudo PATH=/usr/local/pg15/bin:$PATH \
+  ./tests/functional/run_live_functional_test.sh postgres ./build/sniper
 ```

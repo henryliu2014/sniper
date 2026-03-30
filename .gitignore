@@ -2,4 +2,4 @@
 vmlinux.h
 build/
 out/
-build_live/
+build-live/
