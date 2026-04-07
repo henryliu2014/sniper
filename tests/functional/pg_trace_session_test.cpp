@@ -174,6 +174,97 @@ void test_extended_protocol_execute_uses_prepared_sql() {
     expect_contains(execute_out, "sql: select 42");
 }
 
+void test_chunked_frontend_message_reconstructs_large_sql() {
+    PgTraceSession session;
+    session.set_realtime_offset_ns(0);
+
+    std::string sql = "select ";
+    sql.append(5000, 'x');
+    sql += " from t";
+
+    std::string payload(sql);
+    payload.push_back('\0');
+    const auto frontend = typed_message('Q', payload);
+
+    std::vector<unsigned char> first_chunk(frontend.begin(), frontend.begin() + 4096);
+    std::vector<unsigned char> second_chunk(frontend.begin() + 4096, frontend.end());
+
+    auto frontend_event_1 = make_read_event(250, 18, IO_DIRECTION_IN, 1'000ull, first_chunk);
+    auto frontend_event_2 = make_read_event(250, 18, IO_DIRECTION_IN, 2'000ull, second_chunk);
+
+    expect(session.handle_event(&frontend_event_1, sizeof(frontend_event_1)) == 0, "first chunk parse failed");
+    expect(session.handle_event(&frontend_event_2, sizeof(frontend_event_2)) == 0, "second chunk parse failed");
+
+    const auto command_complete = typed_message('C', literal_view("SELECT 1\0"));
+    auto backend_complete = make_read_event(250, 18, IO_DIRECTION_OUT, 3'000ull, command_complete);
+    expect(session.handle_event(&backend_complete, sizeof(backend_complete)) == 0, "large query completion failed");
+
+    std::string output = take_single_output(session);
+    expect_contains(output, "QUERY\n");
+    expect_contains(output, sql);
+}
+
+void test_ready_for_query_flushes_simple_query_when_command_complete_is_missed() {
+    PgTraceSession session;
+    session.set_realtime_offset_ns(0);
+
+    const auto frontend = typed_message('Q', literal_view("insert into t values (1)\0"));
+    auto frontend_event = make_read_event(404, 21, IO_DIRECTION_IN, 1'000ull, frontend);
+    expect(session.handle_event(&frontend_event, sizeof(frontend_event)) == 0, "frontend query failed");
+
+    const auto ready_for_query = typed_message('Z', literal_view("I"));
+    auto backend_ready = make_read_event(404, 21, IO_DIRECTION_OUT, 2'000ull, ready_for_query);
+    expect(session.handle_event(&backend_ready, sizeof(backend_ready)) == 0, "ready for query failed");
+
+    std::string output = take_single_output(session);
+    expect_contains(output, "QUERY\n");
+    expect_contains(output, "sql: insert into t values (1)");
+}
+
+void test_backend_messages_on_unconfirmed_fd_are_ignored() {
+    PgTraceSession session;
+    session.set_realtime_offset_ns(0);
+
+    const auto backend_complete = typed_message('C', literal_view("INSERT 0 1\0"));
+    auto stray_backend = make_read_event(505, 30, IO_DIRECTION_OUT, 1'000ull, backend_complete);
+    expect(session.handle_event(&stray_backend, sizeof(stray_backend)) == 0, "stray backend event failed");
+    expect(session.take_completed_queries().empty(), "stray backend traffic should not emit queries");
+
+    const auto frontend = typed_message('Q', literal_view("insert into t values (2)\0"));
+    auto frontend_event = make_read_event(505, 31, IO_DIRECTION_IN, 2'000ull, frontend);
+    expect(session.handle_event(&frontend_event, sizeof(frontend_event)) == 0, "frontend query failed");
+
+    const auto ready = typed_message('Z', literal_view("I"));
+    auto backend_ready = make_read_event(505, 30, IO_DIRECTION_OUT, 3'000ull, ready);
+    expect(session.handle_event(&backend_ready, sizeof(backend_ready)) == 0, "stray ready event failed");
+    expect(session.take_completed_queries().empty(), "backend traffic on wrong fd should be ignored");
+}
+
+void test_same_pid_can_track_multiple_socket_fds() {
+    PgTraceSession session;
+    session.set_realtime_offset_ns(0);
+
+    const auto frontend_a = typed_message('Q', literal_view("select 1\0"));
+    const auto frontend_b = typed_message('Q', literal_view("select 2\0"));
+    auto frontend_event_a = make_read_event(606, 41, IO_DIRECTION_IN, 1'000ull, frontend_a);
+    auto frontend_event_b = make_read_event(606, 42, IO_DIRECTION_IN, 2'000ull, frontend_b);
+
+    expect(session.handle_event(&frontend_event_a, sizeof(frontend_event_a)) == 0, "first frontend query failed");
+    expect(session.handle_event(&frontend_event_b, sizeof(frontend_event_b)) == 0, "second frontend query failed");
+
+    const auto complete = typed_message('C', literal_view("SELECT 1\0"));
+    auto backend_complete_b = make_read_event(606, 42, IO_DIRECTION_OUT, 3'000ull, complete);
+    auto backend_complete_a = make_read_event(606, 41, IO_DIRECTION_OUT, 4'000ull, complete);
+
+    expect(session.handle_event(&backend_complete_b, sizeof(backend_complete_b)) == 0, "second socket completion failed");
+    std::string second = take_single_output(session);
+    expect_contains(second, "sql: select 2");
+
+    expect(session.handle_event(&backend_complete_a, sizeof(backend_complete_a)) == 0, "first socket completion failed");
+    std::string first = take_single_output(session);
+    expect_contains(first, "sql: select 1");
+}
+
 void test_trace_rendering_includes_operator_steps_and_waits() {
     PgTraceSession session;
     session.set_realtime_offset_ns(0);
@@ -219,6 +310,10 @@ int main() {
 
     test_simple_query_batch_with_sql_splitting();
     test_extended_protocol_execute_uses_prepared_sql();
+    test_chunked_frontend_message_reconstructs_large_sql();
+    test_ready_for_query_flushes_simple_query_when_command_complete_is_missed();
+    test_backend_messages_on_unconfirmed_fd_are_ignored();
+    test_same_pid_can_track_multiple_socket_fds();
     test_trace_rendering_includes_operator_steps_and_waits();
     return 0;
 }

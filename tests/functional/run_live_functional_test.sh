@@ -41,11 +41,15 @@ TMP_DIR=$(mktemp -d)
 PGDATA="$TMP_DIR/pgdata"
 SOCKDIR="$TMP_DIR/socket"
 LOGFILE="$TMP_DIR/postgres.log"
-SNIPER_OUT="$TMP_DIR/sniper.out"
-SNIPER_ERR="$TMP_DIR/sniper.err"
+SNIPER_OUT="./sniper.out"
+SNIPER_ERR="./sniper.err"
+
+SLOW_SQL="select count(*) from t_sniper_slow where strpos(payload, 'ffff') > 0"
 
 mkdir -p "$SOCKDIR"
 chmod -R 0777 "$TMP_DIR"
+echo $SOCKDIR
+
 
 run_pg_cmd() {
     sudo -u "$PG_OS_USER" "$@"
@@ -56,7 +60,7 @@ cleanup() {
     if [[ -f "$PGDATA/postmaster.pid" ]]; then
         run_pg_cmd "$PG_CTL_BIN" -D "$PGDATA" -m immediate stop >/dev/null 2>&1
     fi
-    #rm -rf "$TMP_DIR"
+    rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
@@ -71,19 +75,55 @@ EOF
 
 run_pg_cmd "$PG_CTL_BIN" -D "$PGDATA" -l "$LOGFILE" start >/dev/null
 
-PROBE_DURATION_SEC=5 "$SNIPER_BIN" >"$SNIPER_OUT" 2>"$SNIPER_ERR" &
+PROBE_DURATION_SEC=300 "$SNIPER_BIN" &
 SNIPER_PID=$!
-
 sleep 1
 
 run_pg_cmd "$PSQL_BIN" -h "$SOCKDIR" -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL' >/dev/null
+set jit = off;
+set max_parallel_workers_per_gather = 0;
+set enable_indexscan = off;
+set enable_indexonlyscan = off;
+set enable_bitmapscan = off;
+
 create table if not exists t_sniper(a int);
 truncate t_sniper;
 insert into t_sniper(a) values (1), (2), (3);
 select * from t_sniper order by a;
+
+drop table if exists t_sniper_slow;
+create table t_sniper_slow as
+select g as a,
+       repeat(md5(g::text), 8) as payload
+from generate_series(1, 200000) as g;
+analyze t_sniper_slow;
+select count(*) from t_sniper_slow where strpos(payload, 'ffff') > 0;
 SQL
 
 wait "$SNIPER_PID"
 
-grep -q '^QUERY$' "$SNIPER_OUT"
-grep -q 'sql: select \* from t_sniper order by a' "$SNIPER_OUT"
+if ! grep -q '^QUERY$' "$SNIPER_OUT" || ! grep -Fq 'sql: select * from t_sniper order by a' "$SNIPER_OUT"; then
+    echo "live functional test failed to capture baseline query; tmpdir: $TMP_DIR" >&2
+    echo "--- sniper.err ---" >&2
+    cat "$SNIPER_ERR" >&2 || true
+    echo "--- sniper.out ---" >&2
+    cat "$SNIPER_OUT" >&2 || true
+    echo "--- postgres.log ---" >&2
+    cat "$LOGFILE" >&2 || true
+    exit 1
+fi
+
+if ! grep -Fq "sql: $SLOW_SQL" "$SNIPER_OUT" || \
+   ! grep -Fq '`-- trace' "$SNIPER_OUT" || \
+   ! grep -Fq 'EXECUTE' "$SNIPER_OUT" || \
+   ! grep -Fq 'Seq Scan' "$SNIPER_OUT" || \
+   ! grep -Fq 'exec_scan' "$SNIPER_OUT"; then
+    echo "live functional test failed to capture slow query details; tmpdir: $TMP_DIR" >&2
+    echo "--- sniper.err ---" >&2
+    cat "$SNIPER_ERR" >&2 || true
+    echo "--- sniper.out ---" >&2
+    cat "$SNIPER_OUT" >&2 || true
+    echo "--- postgres.log ---" >&2
+    cat "$LOGFILE" >&2 || true
+    exit 1
+fi

@@ -26,6 +26,7 @@ struct {
 } read_args_map SEC(".maps");
 
 #define MAX_DATA 4096
+#define MAX_IO_CHUNKS 16
 
 enum event_type {
     EVENT_TYPE_IO = 1,
@@ -280,7 +281,61 @@ struct {
 } lwlock_wait_start_map SEC(".maps");
 
 static __always_inline bool is_target_pid(__u32 pid) {
-    return bpf_map_lookup_elem(&target_pids, &pid) != 0;
+    if (bpf_map_lookup_elem(&target_pids, &pid) != 0) {
+        return true;
+    }
+
+    struct task_struct* task = (struct task_struct*)bpf_get_current_task_btf();
+    if (!task) {
+        return false;
+    }
+
+    __u32 parent_pid = BPF_CORE_READ(task, real_parent, tgid);
+    if (parent_pid == 0) {
+        return false;
+    }
+
+    return bpf_map_lookup_elem(&target_pids, &parent_pid) != 0;
+}
+
+static __always_inline int emit_io_events(__u32 pid, __u32 tid, const struct read_args* args, long ret) {
+    #pragma unroll
+    for (int chunk = 0; chunk < MAX_IO_CHUNKS; ++chunk) {
+        const int offset = chunk * MAX_DATA;
+        if ((__s64)offset >= ret) {
+            break;
+        }
+
+        __u32 len = MAX_DATA;
+        __u64 remaining = (__u64)ret - (__u64)offset;
+        if (remaining < MAX_DATA) {
+            len = (__u32)remaining;
+        }
+        if (len == 0 || len > MAX_DATA) {
+            break;
+        }
+
+        struct read_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (!e) {
+            return 0;
+        }
+
+        e->type = EVENT_TYPE_IO;
+        e->pid = pid;
+        e->tid = tid;
+        e->fd = args->fd;
+        e->count = ret;
+        e->len = len;
+        e->direction = args->direction;
+        e->ts_ns = bpf_ktime_get_ns();
+        bpf_get_current_comm(&e->comm, sizeof(e->comm));
+        bpf_probe_read_user(e->data, len, (const void*)(args->buf + offset));
+
+        bpf_ringbuf_submit(e, 0);
+
+
+    }
+    return 0;
 }
 
 static __always_inline __u16 get_operator_stack_depth(__u32 tid) {
@@ -383,7 +438,9 @@ static __always_inline int phase_exit(__u8 phase) {
         bpf_printk("phase_exit: reserve ringbuf failed, key:%d, phase:%d", key.tid, key.phase);
         bpf_map_delete_elem(&phase_start_map, &key);
         return 0;
-    }
+    } else {
+		bpf_printk("phase_exit: reserve ringbuf ok, key:%d, phase:%d", key.tid, key.phase);
+	}
 
     e->type = EVENT_TYPE_PHASE;
     e->start_ns = *start_ns;
@@ -822,25 +879,7 @@ int trace_sys_exit_recvfrom(struct trace_event_raw_sys_exit* ctx) {
         return 0;
     }
 
-    int len = ret > MAX_DATA ? MAX_DATA : (int)ret;
-    struct read_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        bpf_map_delete_elem(&read_args_map, &tid);
-        return 0;
-    }
-
-    e->type = EVENT_TYPE_IO;
-    e->pid = pid;
-    e->tid = tid;
-    e->fd = args->fd;
-    e->count = ret;
-    e->len = len;
-    e->direction = args->direction;
-    e->ts_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user(e->data, len, (const void*)args->buf);
-
-    bpf_ringbuf_submit(e, 0);
+    emit_io_events(pid, tid, args, ret);
     bpf_map_delete_elem(&read_args_map, &tid);
     return 0;
 }
@@ -865,25 +904,7 @@ int trace_sys_exit_read(struct trace_event_raw_sys_exit* ctx) {
         return 0;
     }
 
-    int len = ret > MAX_DATA ? MAX_DATA : (int)ret;
-    struct read_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        bpf_map_delete_elem(&read_args_map, &tid);
-        return 0;
-    }
-
-    e->type = EVENT_TYPE_IO;
-    e->pid = pid;
-    e->tid = tid;
-    e->fd = args->fd;
-    e->count = ret;
-    e->len = len;
-    e->direction = args->direction;
-    e->ts_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user(e->data, len, (const void*)args->buf);
-
-    bpf_ringbuf_submit(e, 0);
+    emit_io_events(pid, tid, args, ret);
     bpf_map_delete_elem(&read_args_map, &tid);
     return 0;
 }
@@ -902,6 +923,8 @@ int trace_sys_enter_write(struct trace_event_raw_sys_enter* ctx) {
         .direction = IO_DIRECTION_OUT,
     };
     bpf_map_update_elem(&read_args_map, &tid, &args, BPF_ANY);
+
+	bpf_printk("trace_sys_enter_write");
     return 0;
 }
 
@@ -919,6 +942,8 @@ int trace_sys_enter_sendto(struct trace_event_raw_sys_enter* ctx) {
         .direction = IO_DIRECTION_OUT,
     };
     bpf_map_update_elem(&read_args_map, &tid, &args, BPF_ANY);
+
+	bpf_printk("trace_sys_enter_sendto");
     return 0;
 }
 
@@ -942,26 +967,10 @@ int trace_sys_exit_write(struct trace_event_raw_sys_exit* ctx) {
         return 0;
     }
 
-    int len = ret > MAX_DATA ? MAX_DATA : (int)ret;
-    struct read_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        bpf_map_delete_elem(&read_args_map, &tid);
-        return 0;
-    }
-
-    e->type = EVENT_TYPE_IO;
-    e->pid = pid;
-    e->tid = tid;
-    e->fd = args->fd;
-    e->count = ret;
-    e->len = len;
-    e->direction = args->direction;
-    e->ts_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user(e->data, len, (const void*)args->buf);
-
-    bpf_ringbuf_submit(e, 0);
+    emit_io_events(pid, tid, args, ret);
     bpf_map_delete_elem(&read_args_map, &tid);
+
+	bpf_printk("trace_sys_exit_write");
     return 0;
 }
 
@@ -985,26 +994,10 @@ int trace_sys_exit_sendto(struct trace_event_raw_sys_exit* ctx) {
         return 0;
     }
 
-    int len = ret > MAX_DATA ? MAX_DATA : (int)ret;
-    struct read_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        bpf_map_delete_elem(&read_args_map, &tid);
-        return 0;
-    }
-
-    e->type = EVENT_TYPE_IO;
-    e->pid = pid;
-    e->tid = tid;
-    e->fd = args->fd;
-    e->count = ret;
-    e->len = len;
-    e->direction = args->direction;
-    e->ts_ns = bpf_ktime_get_ns();
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    bpf_probe_read_user(e->data, len, (const void*)args->buf);
-
-    bpf_ringbuf_submit(e, 0);
+    emit_io_events(pid, tid, args, ret);
     bpf_map_delete_elem(&read_args_map, &tid);
+
+	bpf_printk("trace_sys_exit_sendto");
     return 0;
 }
 

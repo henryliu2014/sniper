@@ -103,7 +103,23 @@ struct simple_batch_state {
     size_t pending_count;
 };
 
+struct connection_key {
+    uint32_t pid;
+    int fd;
+
+    bool operator==(const connection_key& other) const {
+        return pid == other.pid && fd == other.fd;
+    }
+};
+
+struct connection_key_hash {
+    size_t operator()(const connection_key& key) const {
+        return (static_cast<size_t>(key.pid) << 32) ^ static_cast<uint32_t>(key.fd);
+    }
+};
+
 struct connection_state {
+    bool protocol_confirmed = false;
     std::string inbound;
     std::string outbound;
     std::deque<query_state> pending_queries;
@@ -133,6 +149,88 @@ static std::string_view trim_sql(std::string_view sql) {
 
 static bool is_ident_char(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool is_known_frontend_tag(unsigned char tag) {
+    switch (tag) {
+    case 'B':
+    case 'C':
+    case 'D':
+    case 'E':
+    case 'F':
+    case 'H':
+    case 'P':
+    case 'Q':
+    case 'S':
+    case 'X':
+    case 'd':
+    case 'f':
+    case 'p':
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool is_known_backend_tag(unsigned char tag) {
+    switch (tag) {
+    case '1':
+    case '2':
+    case '3':
+    case 'A':
+    case 'C':
+    case 'D':
+    case 'E':
+    case 'G':
+    case 'H':
+    case 'I':
+    case 'K':
+    case 'N':
+    case 'R':
+    case 'S':
+    case 'T':
+    case 'V':
+    case 'W':
+    case 'Z':
+    case 'c':
+    case 'd':
+    case 'n':
+    case 's':
+    case 't':
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool has_sql_content(std::string_view sql) {
+    for (size_t i = 0; i < sql.size(); ++i) {
+        char c = sql[i];
+        char next = (i + 1 < sql.size()) ? sql[i + 1] : '\0';
+
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            continue;
+        }
+        if (c == '-' && next == '-') {
+            i += 2;
+            while (i < sql.size() && sql[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            i += 2;
+            while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) {
+                ++i;
+            }
+            if (i + 1 < sql.size()) {
+                ++i;
+            }
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 static std::vector<std::string> split_simple_query(std::string_view sql) {
@@ -220,7 +318,7 @@ static std::vector<std::string> split_simple_query(std::string_view sql) {
         }
         if (c == ';') {
             std::string_view stmt = trim_sql(sql.substr(start, i - start));
-            if (!stmt.empty()) {
+            if (!stmt.empty() && has_sql_content(stmt)) {
                 statements.emplace_back(stmt);
             }
             start = i + 1;
@@ -228,7 +326,7 @@ static std::vector<std::string> split_simple_query(std::string_view sql) {
     }
 
     std::string_view stmt = trim_sql(sql.substr(start));
-    if (!stmt.empty()) {
+    if (!stmt.empty() && has_sql_content(stmt)) {
         statements.emplace_back(stmt);
     }
     return statements;
@@ -300,8 +398,7 @@ static const char* seq_scan_step_name(uint8_t step_id) {
 } // namespace
 
 struct PgTraceSession::impl {
-    std::unordered_map<int, connection_state> connections;
-    std::unordered_map<uint32_t, int> pid_to_fd;
+    std::unordered_map<connection_key, connection_state, connection_key_hash> connections;
     uint64_t realtime_offset_ns = 0;
     uint64_t next_batch_id = 1;
     std::vector<std::string> completed_queries;
@@ -342,24 +439,25 @@ struct PgTraceSession::impl {
         out << prefix << (last ? "`-- " : "|-- ") << key << ": " << value << '\n';
     }
 
-    query_state* current_query_for_pid(uint32_t pid) {
-        auto fd_it = pid_to_fd.find(pid);
-        if (fd_it == pid_to_fd.end()) {
-            return nullptr;
-        }
-        auto conn_it = connections.find(fd_it->second);
-        if (conn_it == connections.end() || conn_it->second.pending_queries.empty()) {
-            return nullptr;
-        }
-        return &conn_it->second.pending_queries.front();
+    static connection_key make_connection_key(uint32_t pid, int fd) {
+        return connection_key{.pid = pid, .fd = fd};
     }
 
-    void queue_query(int fd, request_kind kind, const char* tag, const char* query, size_t len,
+    query_state* current_query_for_pid(uint32_t pid) {
+        for (auto& [key, conn] : connections) {
+            if (key.pid == pid && !conn.pending_queries.empty()) {
+                return &conn.pending_queries.front();
+            }
+        }
+        return nullptr;
+    }
+
+    void queue_query(const connection_key& key, request_kind kind, const char* tag, const char* query, size_t len,
                      uint64_t ts_ns, uint64_t batch_id = 0) {
         if (len == 0) {
             return;
         }
-        auto& conn = connections[fd];
+        auto& conn = connections[key];
         conn.pending_queries.push_back(query_state{
             .kind = kind,
             .tag = tag,
@@ -530,8 +628,8 @@ struct PgTraceSession::impl {
         return out.str();
     }
 
-    void finish_query(int fd, request_kind kind, uint64_t ts_ns) {
-        auto it = connections.find(fd);
+    void finish_query(const connection_key& key, request_kind kind, uint64_t ts_ns) {
+        auto it = connections.find(key);
         if (it == connections.end()) {
             return;
         }
@@ -553,21 +651,21 @@ struct PgTraceSession::impl {
         }
     }
 
-    void finish_front_query(int fd, uint64_t ts_ns) {
-        auto it = connections.find(fd);
+    void finish_front_query(const connection_key& key, uint64_t ts_ns) {
+        auto it = connections.find(key);
         if (it == connections.end() || it->second.pending_queries.empty()) {
             return;
         }
-        finish_query(fd, it->second.pending_queries.front().kind, ts_ns);
+        finish_query(key, it->second.pending_queries.front().kind, ts_ns);
     }
 
-    void queue_simple_query_batch(int fd, std::string_view sql, uint64_t ts_ns) {
+    void queue_simple_query_batch(const connection_key& key, std::string_view sql, uint64_t ts_ns) {
         std::vector<std::string> statements = split_simple_query(sql);
         if (statements.empty()) {
             return;
         }
 
-        auto& conn = connections[fd];
+        auto& conn = connections[key];
         uint64_t batch_id = next_batch_id++;
         conn.pending_simple_batches.push_back(simple_batch_state{
             .batch_id = batch_id,
@@ -575,13 +673,13 @@ struct PgTraceSession::impl {
         });
 
         for (const std::string& statement : statements) {
-            queue_query(fd, request_kind::simple_query, "QUERY",
+            queue_query(key, request_kind::simple_query, "QUERY",
                         statement.data(), statement.size(), ts_ns, batch_id);
         }
     }
 
-    void finish_simple_query_batch(int fd) {
-        auto it = connections.find(fd);
+    void finish_simple_query_batch(const connection_key& key, uint64_t ts_ns) {
+        auto it = connections.find(key);
         if (it == connections.end()) {
             return;
         }
@@ -591,54 +689,69 @@ struct PgTraceSession::impl {
             return;
         }
 
-        simple_batch_state batch = conn.pending_simple_batches.front();
-        conn.pending_simple_batches.pop_front();
+        auto& batch = conn.pending_simple_batches.front();
         while (batch.pending_count > 0 && !conn.pending_queries.empty()) {
-            const query_state& query = conn.pending_queries.front();
+            query_state& query = conn.pending_queries.front();
             if (query.kind != request_kind::simple_query || query.batch_id != batch.batch_id) {
                 break;
             }
+            completed_queries.push_back(render_query_timing(query, ts_ns));
             conn.pending_queries.pop_front();
-            --batch.pending_count;
+            if (batch.pending_count > 0) {
+                --batch.pending_count;
+            }
         }
+        conn.pending_simple_batches.pop_front();
     }
 
-    void parse_frontend_messages(int fd, const unsigned char* data, size_t len, uint64_t ts_ns) {
+    bool parse_frontend_messages(uint32_t pid, int fd, const unsigned char* data, size_t len, uint64_t ts_ns) {
         if (len == 0) {
-            return;
+            return false;
         }
 
-        auto& buf = connections[fd].inbound;
+        const connection_key key = make_connection_key(pid, fd);
+        auto& conn = connections[key];
+        auto& buf = conn.inbound;
+        const bool had_partial = !buf.empty();
+        if (!had_partial) {
+            const unsigned char first = data[0];
+            if (first >= 'A' && first <= 'Z' && !is_known_frontend_tag(first)) {
+                return false;
+            }
+        }
         buf.append(reinterpret_cast<const char*>(data), len);
 
         constexpr size_t kMaxBuffer = 1u << 20;
         if (buf.size() > kMaxBuffer) {
             buf.clear();
-            return;
+            return false;
         }
+
+        bool accepted = true;
+        conn.protocol_confirmed = true;
 
         while (true) {
             if (buf.size() < 4) {
-                return;
+                return accepted;
             }
 
             unsigned char first = static_cast<unsigned char>(buf[0]);
             bool typed = (first >= 'A' && first <= 'Z');
             size_t header = typed ? 5 : 4;
             if (buf.size() < header) {
-                return;
+                return accepted;
             }
 
             const unsigned char* p = reinterpret_cast<const unsigned char*>(buf.data());
             uint32_t msg_len = typed ? read_be32(p + 1) : read_be32(p);
             if (msg_len < 4) {
                 buf.clear();
-                return;
+                return false;
             }
 
             size_t total = typed ? (1 + msg_len) : msg_len;
             if (buf.size() < total) {
-                return;
+                return accepted;
             }
 
             if (typed && (first == 'Q' || first == 'P')) {
@@ -647,18 +760,18 @@ struct PgTraceSession::impl {
                 if (first == 'Q') {
                     const char* end = static_cast<const char*>(std::memchr(payload, '\0', payload_len));
                     size_t qlen = end ? static_cast<size_t>(end - payload) : payload_len;
-                    queue_simple_query_batch(fd, std::string_view(payload, qlen), ts_ns);
+                    queue_simple_query_batch(key, std::string_view(payload, qlen), ts_ns);
                 } else {
                     const char* name_end = static_cast<const char*>(std::memchr(payload, '\0', payload_len));
                     if (name_end) {
-                        auto& conn = connections[fd];
+                        auto& conn = connections[key];
                         size_t remaining = payload_len - static_cast<size_t>(name_end - payload) - 1;
                         const char* query = name_end + 1;
                         const char* q_end = static_cast<const char*>(std::memchr(query, '\0', remaining));
                         size_t qlen = q_end ? static_cast<size_t>(q_end - query) : remaining;
                         std::string stmt_name(payload, static_cast<size_t>(name_end - payload));
                         conn.prepared_statements[stmt_name] = std::string(query, qlen);
-                        queue_query(fd, request_kind::prepare, "PREPARE", query, qlen, ts_ns);
+                        queue_query(key, request_kind::prepare, "PREPARE", query, qlen, ts_ns);
                     }
                 }
             } else if (typed && first == 'B') {
@@ -670,7 +783,7 @@ struct PgTraceSession::impl {
                     const char* statement = portal_end + 1;
                     const char* statement_end = static_cast<const char*>(std::memchr(statement, '\0', remaining));
                     if (statement_end) {
-                        connections[fd].portals[std::string(payload, static_cast<size_t>(portal_end - payload))] =
+                        connections[key].portals[std::string(payload, static_cast<size_t>(portal_end - payload))] =
                             std::string(statement, static_cast<size_t>(statement_end - statement));
                     }
                 }
@@ -679,13 +792,13 @@ struct PgTraceSession::impl {
                 size_t payload_len = msg_len - 4;
                 const char* portal_end = static_cast<const char*>(std::memchr(payload, '\0', payload_len));
                 if (portal_end) {
-                    auto& conn = connections[fd];
+                    auto& conn = connections[key];
                     std::string portal(payload, static_cast<size_t>(portal_end - payload));
                     auto portal_it = conn.portals.find(portal);
                     if (portal_it != conn.portals.end()) {
                         auto stmt_it = conn.prepared_statements.find(portal_it->second);
                         if (stmt_it != conn.prepared_statements.end()) {
-                            queue_query(fd, request_kind::execute, "EXECUTE",
+                            queue_query(key, request_kind::execute, "EXECUTE",
                                         stmt_it->second.data(), stmt_it->second.size(), ts_ns);
                         }
                     }
@@ -696,46 +809,57 @@ struct PgTraceSession::impl {
         }
     }
 
-    void parse_backend_messages(int fd, const unsigned char* data, size_t len, uint64_t ts_ns) {
+    bool parse_backend_messages(uint32_t pid, int fd, const unsigned char* data, size_t len, uint64_t ts_ns) {
         if (len == 0) {
-            return;
+            return false;
         }
 
-        auto& buf = connections[fd].outbound;
+        const connection_key key = make_connection_key(pid, fd);
+        auto conn_it = connections.find(key);
+        if (conn_it == connections.end()) {
+            return false;
+        }
+        auto& conn = conn_it->second;
+        auto& buf = conn.outbound;
+        if (buf.empty() && (!conn.protocol_confirmed || !is_known_backend_tag(data[0]))) {
+            return false;
+        }
         buf.append(reinterpret_cast<const char*>(data), len);
 
         constexpr size_t kMaxBuffer = 1u << 20;
         if (buf.size() > kMaxBuffer) {
             buf.clear();
-            return;
+            return false;
         }
+
+        bool accepted = true;
 
         while (true) {
             if (buf.size() < 5) {
-                return;
+                return accepted;
             }
 
             const unsigned char* p = reinterpret_cast<const unsigned char*>(buf.data());
             uint32_t msg_len = read_be32(p + 1);
             if (msg_len < 4) {
                 buf.clear();
-                return;
+                return false;
             }
 
             size_t total = 1 + msg_len;
             if (buf.size() < total) {
-                return;
+                return accepted;
             }
 
             unsigned char tag = p[0];
             if (tag == 'C' || tag == 'E' || tag == 'I') {
-                finish_front_query(fd, ts_ns);
+                finish_front_query(key, ts_ns);
             } else if (tag == '1') {
-                finish_query(fd, request_kind::prepare, ts_ns);
+                finish_query(key, request_kind::prepare, ts_ns);
             } else if (tag == 's') {
-                finish_query(fd, request_kind::execute, ts_ns);
+                finish_query(key, request_kind::execute, ts_ns);
             } else if (tag == 'Z') {
-                finish_simple_query_batch(fd);
+                finish_simple_query_batch(key, ts_ns);
             }
 
             buf.erase(0, total);
@@ -754,12 +878,11 @@ struct PgTraceSession::impl {
                 return -1;
             }
             const auto& event = *static_cast<const read_event*>(data);
-            pid_to_fd[event.pid] = event.fd;
             if (event.len > 0) {
                 if (event.direction == IO_DIRECTION_IN) {
-                    parse_frontend_messages(event.fd, event.data, static_cast<size_t>(event.len), event.ts_ns);
+                    parse_frontend_messages(event.pid, event.fd, event.data, static_cast<size_t>(event.len), event.ts_ns);
                 } else if (event.direction == IO_DIRECTION_OUT) {
-                    parse_backend_messages(event.fd, event.data, static_cast<size_t>(event.len), event.ts_ns);
+                    parse_backend_messages(event.pid, event.fd, event.data, static_cast<size_t>(event.len), event.ts_ns);
                 }
             }
             return 0;
@@ -840,6 +963,7 @@ struct PgTraceSession::impl {
             return 0;
         }
         default:
+            printf("invalid event");
             return -1;
         }
     }

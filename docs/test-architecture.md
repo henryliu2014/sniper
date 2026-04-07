@@ -23,7 +23,7 @@ This layer is pure userspace logic and is the primary regression surface. The fi
 
 `pg_probe.cpp` is now the runtime adapter. It is responsible for:
 
-- finding PostgreSQL PIDs
+- finding PostgreSQL postmaster PIDs
 - loading and attaching BPF programs
 - polling the ring buffer
 - forwarding events into `PgTraceSession`
@@ -63,6 +63,13 @@ This is a fast component-functional lane. It validates the behavior users care a
 - asserts on the emitted trace output
 
 The script requires the PostgreSQL service account name as its first argument so the harness does not need to guess which OS user should own the disposable cluster.
+
+The live fixture now includes a deliberately slow sequential-scan query over a generated table so the assertions can verify detailed trace output such as:
+
+- `trace`
+- `EXECUTE`
+- `Seq Scan`
+- `exec_scan`
 
 This lane is opt-in and should be enabled only on hosts that can run BPF attachment successfully.
 

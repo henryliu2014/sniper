@@ -21,6 +21,9 @@ extern const unsigned char pg_probe_bpf_blob_end[];
 
 namespace {
 volatile sig_atomic_t g_stop = 0;
+unsigned long long g_event_seq = 0;
+FILE* g_ringbuf_dump = nullptr;
+FILE* g_trace_output = nullptr;
 
 void handle_sigint(int) {
     g_stop = 1;
@@ -31,14 +34,170 @@ static __u64 timespec_to_ns(const timespec& ts) {
 }
 PgTraceSession g_trace_session;
 
+static FILE* ringbuf_dump_stream() {
+    return g_ringbuf_dump ? g_ringbuf_dump : stderr;
+}
+
+static FILE* trace_output_stream() {
+    return g_trace_output ? g_trace_output : stdout;
+}
+
+static void dump_bytes(FILE* out, const unsigned char* data, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = data[i];
+        switch (c) {
+        case '\n':
+            fputs("\\n", out);
+            break;
+        case '\r':
+            fputs("\\r", out);
+            break;
+        case '\t':
+            fputs("\\t", out);
+            break;
+        case '\\':
+            fputs("\\\\", out);
+            break;
+        default:
+            if (std::isprint(c)) {
+                fputc(static_cast<int>(c), out);
+            } else {
+                fprintf(out, "\\x%02x", c);
+            }
+            break;
+        }
+    }
+}
+
+static void dump_ringbuf_event(const void* data, size_t data_sz) {
+    FILE* out = ringbuf_dump_stream();
+    if (data == nullptr || data_sz < sizeof(event_header)) {
+        fprintf(out, "ringbuf[%llu] invalid event data_sz=%zu\n", g_event_seq++, data_sz);
+        fflush(out);
+        return;
+    }
+
+    const auto* header = static_cast<const event_header*>(data);
+    const unsigned long long seq = g_event_seq++;
+    switch (header->type) {
+    case EVENT_TYPE_IO: {
+        if (data_sz < sizeof(read_event)) {
+            fprintf(out, "ringbuf[%llu] IO truncated data_sz=%zu\n", seq, data_sz);
+            fflush(out);
+            return;
+        }
+        const auto& event = *static_cast<const read_event*>(data);
+        fprintf(out,
+                "ringbuf[%llu] IO ts=%llu pid=%u tid=%u fd=%d dir=%s count=%lld len=%d comm=%s data=",
+                seq,
+                static_cast<unsigned long long>(event.ts_ns),
+                event.pid,
+                event.tid,
+                event.fd,
+                event.direction == IO_DIRECTION_IN ? "IN" : "OUT",
+                static_cast<long long>(event.count),
+                event.len,
+                event.comm);
+        const size_t dump_len = event.len > 0 ? static_cast<size_t>(event.len) : 0;
+        dump_bytes(out, event.data, dump_len);
+        fputc('\n', out);
+        break;
+    }
+    case EVENT_TYPE_PHASE: {
+        if (data_sz < sizeof(phase_event)) {
+            fprintf(out, "ringbuf[%llu] PHASE truncated data_sz=%zu\n", seq, data_sz);
+            fflush(out);
+            return;
+        }
+        const auto& event = *static_cast<const phase_event*>(data);
+        fprintf(out,
+                "ringbuf[%llu] PHASE pid=%u tid=%u phase=%u start=%llu end=%llu comm=%s\n",
+                seq,
+                event.pid,
+                event.tid,
+                event.phase,
+                static_cast<unsigned long long>(event.start_ns),
+                static_cast<unsigned long long>(event.end_ns),
+                event.comm);
+        break;
+    }
+    case EVENT_TYPE_OPERATOR: {
+        if (data_sz < sizeof(operator_event)) {
+            fprintf(out, "ringbuf[%llu] OP truncated data_sz=%zu\n", seq, data_sz);
+            fflush(out);
+            return;
+        }
+        const auto& event = *static_cast<const operator_event*>(data);
+        fprintf(out,
+                "ringbuf[%llu] OP pid=%u tid=%u op_id=%u depth=%u start=%llu end=%llu comm=%s\n",
+                seq,
+                event.pid,
+                event.tid,
+                event.op_id,
+                event.depth,
+                static_cast<unsigned long long>(event.start_ns),
+                static_cast<unsigned long long>(event.end_ns),
+                event.comm);
+        break;
+    }
+    case EVENT_TYPE_SEQ_SCAN_STEP: {
+        if (data_sz < sizeof(seq_scan_step_event)) {
+            fprintf(out, "ringbuf[%llu] STEP truncated data_sz=%zu\n", seq, data_sz);
+            fflush(out);
+            return;
+        }
+        const auto& event = *static_cast<const seq_scan_step_event*>(data);
+        fprintf(out,
+                "ringbuf[%llu] STEP pid=%u tid=%u step_id=%u depth=%u start=%llu end=%llu comm=%s\n",
+                seq,
+                event.pid,
+                event.tid,
+                event.step_id,
+                event.seq_scan_depth,
+                static_cast<unsigned long long>(event.start_ns),
+                static_cast<unsigned long long>(event.end_ns),
+                event.comm);
+        break;
+    }
+    case EVENT_TYPE_LWLOCK_WAIT: {
+        if (data_sz < sizeof(lwlock_wait_event)) {
+            fprintf(out, "ringbuf[%llu] WAIT truncated data_sz=%zu\n", seq, data_sz);
+            fflush(out);
+            return;
+        }
+        const auto& event = *static_cast<const lwlock_wait_event*>(data);
+        fprintf(out,
+                "ringbuf[%llu] WAIT pid=%u tid=%u op_id=%u op_depth=%u step_id=%u step_depth=%u start=%llu end=%llu comm=%s\n",
+                seq,
+                event.pid,
+                event.tid,
+                event.op_id,
+                event.op_depth,
+                event.step_id,
+                event.step_depth,
+                static_cast<unsigned long long>(event.start_ns),
+                static_cast<unsigned long long>(event.end_ns),
+                event.comm);
+        break;
+    }
+    default:
+        fprintf(out, "ringbuf[%llu] UNKNOWN type=%u data_sz=%zu\n", seq, header->type, data_sz);
+        break;
+    }
+    fflush(out);
+}
+
 int handle_event(void* /*ctx*/, void* data, size_t data_sz) {
+    dump_ringbuf_event(data, data_sz);
     if (g_trace_session.handle_event(data, data_sz) != 0) {
         printf("no header type");
         return 0;
     }
 
+    FILE* trace_out = trace_output_stream();
     for (const std::string& rendered_query : g_trace_session.take_completed_queries()) {
-        fputs(rendered_query.c_str(), stdout);
+        fputs(rendered_query.c_str(), trace_out);
+        fflush(trace_out);
     }
     return 0;
 }
@@ -68,6 +227,13 @@ static bpf_link* attach_named_uprobe(struct bpf_program* prog, const char* binar
 static bool link_is_ok(struct bpf_link* link) {
     return link != nullptr && libbpf_get_error(link) == 0;
 }
+
+static long link_error(struct bpf_link* link) {
+    if (link == nullptr) {
+        return -EINVAL;
+    }
+    return libbpf_get_error(link);
+}
 } // namespace
 
 int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
@@ -78,6 +244,32 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
 
     if (duration_sec <= 0) {
         duration_sec = 10;
+    }
+
+    const char* ringbuf_dump_path = std::getenv("SNIPER_RINGBUF_DUMP_FILE");
+    if (!ringbuf_dump_path || ringbuf_dump_path[0] == '\0') {
+        ringbuf_dump_path = "sniper_ringbuf.log";
+    }
+    g_ringbuf_dump = fopen(ringbuf_dump_path, "w");
+    if (!g_ringbuf_dump) {
+        fprintf(stderr, "pg_probe: failed to open ring buffer dump file %s: %s\n",
+                ringbuf_dump_path, strerror(errno));
+    } else {
+        fprintf(stderr, "pg_probe: writing ring buffer dump to %s\n", ringbuf_dump_path);
+        fflush(stderr);
+    }
+
+    const char* trace_output_path = std::getenv("SNIPER_TRACE_OUTPUT_FILE");
+    if (!trace_output_path || trace_output_path[0] == '\0') {
+        trace_output_path = "sniper_trace.out";
+    }
+    g_trace_output = fopen(trace_output_path, "w");
+    if (!g_trace_output) {
+        fprintf(stderr, "pg_probe: failed to open trace output file %s: %s\n",
+                trace_output_path, strerror(errno));
+    } else {
+        fprintf(stderr, "pg_probe: writing rendered traces to %s\n", trace_output_path);
+        fflush(stderr);
     }
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
@@ -228,6 +420,8 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
         fprintf(stderr, "pg_probe: failed to resolve postgres binary path\n");
         return -1;
     }
+    fprintf(stderr, "pg_probe: targeting postgres binary %s with %zu seeded postmaster pids\n",
+            postgres_binary.c_str(), postgres_pids.size());
 
     obj = bpf_object__open_mem(
         pg_probe_bpf_blob_start,
@@ -274,15 +468,29 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
         prog_lwlock_wait_enters.push_back(bpf_object__find_program_by_name(obj, spec.enter_prog_name));
         prog_lwlock_wait_exits.push_back(bpf_object__find_program_by_name(obj, spec.exit_prog_name));
     }
-    auto all_programs_found = [](const auto& programs) {
-        return std::all_of(programs.begin(), programs.end(),
-                           [](const bpf_program* prog) { return prog != nullptr; });
-    };
-    if (!all_programs_found(prog_tracepoint_enters) || !all_programs_found(prog_tracepoint_exits) ||
-        !all_programs_found(prog_phase_enters) || !all_programs_found(prog_phase_exits)) {
-        fprintf(stderr, "pg_probe: program not found\n");
-        bpf_object__close(obj);
-        return -1;
+    for (size_t i = 0; i < std::size(tracepoint_specs); ++i) {
+        if (!prog_tracepoint_enters[i]) {
+            fprintf(stderr, "pg_probe: required BPF program not found: %s\n", tracepoint_specs[i].enter_prog_name);
+            bpf_object__close(obj);
+            return -1;
+        }
+        if (!prog_tracepoint_exits[i]) {
+            fprintf(stderr, "pg_probe: required BPF program not found: %s\n", tracepoint_specs[i].exit_prog_name);
+            bpf_object__close(obj);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < std::size(phase_specs); ++i) {
+        if (!prog_phase_enters[i]) {
+            fprintf(stderr, "pg_probe: required BPF program not found: %s\n", phase_specs[i].enter_prog_name);
+            bpf_object__close(obj);
+            return -1;
+        }
+        if (!prog_phase_exits[i]) {
+            fprintf(stderr, "pg_probe: required BPF program not found: %s\n", phase_specs[i].exit_prog_name);
+            bpf_object__close(obj);
+            return -1;
+        }
     }
 
     link_tracepoint_enters.reserve(std::size(tracepoint_specs));
@@ -365,16 +573,37 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
         link_lwlock_wait_enters.push_back(enter_link);
         link_lwlock_wait_exits.push_back(exit_link);
     }
-    auto all_links_ok = [](const auto& links) {
-        return std::all_of(links.begin(), links.end(),
-                           [](bpf_link* link) { return link_is_ok(link); });
-    };
-    if (!all_links_ok(link_tracepoint_enters) || !all_links_ok(link_tracepoint_exits) ||
-        !all_links_ok(link_phase_enters) || !all_links_ok(link_phase_exits)) {
-        fprintf(stderr, "pg_probe: attach failed\n");
-        destroy_links();
-        bpf_object__close(obj);
-        return -1;
+    for (size_t i = 0; i < std::size(tracepoint_specs); ++i) {
+        if (!link_is_ok(link_tracepoint_enters[i])) {
+            fprintf(stderr, "pg_probe: tracepoint attach failed: %s/%s err=%ld\n",
+                    tracepoint_specs[i].category, tracepoint_specs[i].enter_event_name, link_error(link_tracepoint_enters[i]));
+            destroy_links();
+            bpf_object__close(obj);
+            return -1;
+        }
+        if (!link_is_ok(link_tracepoint_exits[i])) {
+            fprintf(stderr, "pg_probe: tracepoint attach failed: %s/%s err=%ld\n",
+                    tracepoint_specs[i].category, tracepoint_specs[i].exit_event_name, link_error(link_tracepoint_exits[i]));
+            destroy_links();
+            bpf_object__close(obj);
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < std::size(phase_specs); ++i) {
+        if (!link_is_ok(link_phase_enters[i])) {
+            fprintf(stderr, "pg_probe: uprobe attach failed: %s err=%ld binary=%s\n",
+                    phase_specs[i].func_name, link_error(link_phase_enters[i]), postgres_binary.c_str());
+            destroy_links();
+            bpf_object__close(obj);
+            return -1;
+        }
+        if (!link_is_ok(link_phase_exits[i])) {
+            fprintf(stderr, "pg_probe: uretprobe attach failed: %s err=%ld binary=%s\n",
+                    phase_specs[i].func_name, link_error(link_phase_exits[i]), postgres_binary.c_str());
+            destroy_links();
+            bpf_object__close(obj);
+            return -1;
+        }
     }
 
     int pid_map_fd = bpf_object__find_map_fd_by_name(obj, "target_pids");
@@ -418,7 +647,7 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
 
     signal(SIGINT, handle_sigint);
 
-    const int timeout_ms = 200;
+    const int timeout_ms = 100;
     const int max_iters = (duration_sec * 1000) / timeout_ms;
     for (int i = 0; i < max_iters && !g_stop; ++i) {
         int err = ring_buffer__poll(rb, timeout_ms);
@@ -431,5 +660,13 @@ int pg_probe(const std::vector<pid_t>& postgres_pids, int duration_sec) {
     ring_buffer__free(rb);
     destroy_links();
     bpf_object__close(obj);
+    if (g_ringbuf_dump) {
+        fclose(g_ringbuf_dump);
+        g_ringbuf_dump = nullptr;
+    }
+    if (g_trace_output) {
+        fclose(g_trace_output);
+        g_trace_output = nullptr;
+    }
     return 0;
 }

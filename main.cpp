@@ -4,6 +4,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <cctype>
 #include <algorithm>
 #include "pg_probe.h"
@@ -30,11 +31,37 @@ static std::string read_file(const std::string& path) {
     return data;
 }
 
-static std::vector<pid_t> find_postgres_pids() {
-    std::vector<pid_t> pids;
+static pid_t read_ppid(pid_t pid) {
+    std::ifstream f("/proc/" + std::to_string(pid) + "/status");
+    if (!f) {
+        return -1;
+    }
+
+    std::string key;
+    while (f >> key) {
+        if (key == "PPid:") {
+            pid_t ppid = -1;
+            f >> ppid;
+            return ppid;
+        }
+        std::string value;
+        std::getline(f, value);
+    }
+
+    return -1;
+}
+
+static std::vector<pid_t> find_postmaster_pids() {
+    struct postgres_process {
+        pid_t pid;
+        pid_t ppid;
+    };
+
+    std::vector<postgres_process> postgres_processes;
+    std::unordered_set<pid_t> postgres_pids;
     DIR* dir = opendir("/proc");
     if (!dir) {
-        return pids;
+        return {};
     }
 
     dirent* ent = nullptr;
@@ -64,24 +91,37 @@ static std::vector<pid_t> find_postgres_pids() {
             continue;
         }
 
-        pids.push_back(pid);
+        postgres_processes.push_back({
+            .pid = pid,
+            .ppid = read_ppid(pid),
+        });
+        postgres_pids.insert(pid);
     }
 
     closedir(dir);
-    std::sort(pids.begin(), pids.end());
-    pids.erase(std::unique(pids.begin(), pids.end()), pids.end());
-    return pids;
+
+    std::vector<pid_t> postmasters;
+    for (const auto& process : postgres_processes) {
+        if (process.ppid > 0 && postgres_pids.contains(process.ppid)) {
+            continue;
+        }
+        postmasters.push_back(process.pid);
+    }
+
+    std::sort(postmasters.begin(), postmasters.end());
+    postmasters.erase(std::unique(postmasters.begin(), postmasters.end()), postmasters.end());
+    return postmasters;
 }
 
 // TIP To <b>Run</b> code, press <shortcut actionId="Run"/> or click the <icon src="AllIcons.Actions.Execute"/> icon in the gutter.
 int main() {
-    std::vector<pid_t> pids = find_postgres_pids();
+    std::vector<pid_t> pids = find_postmaster_pids();
     if (pids.empty()) {
-        std::cerr << "No running postgres processes found\n";
+        std::cerr << "No running postgres postmaster processes found\n";
         return 1;
     }
 
-    int duration_sec = 100;
+    int duration_sec = 200;
     if (const char* d = std::getenv("PROBE_DURATION_SEC")) {
         duration_sec = std::atoi(d);
         if (duration_sec <= 0) {
